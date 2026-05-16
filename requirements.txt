@@ -4,3 +4,5 @@ faster-whisper
 requests
 sounddevice
 scipy
+azure-cognitiveservices-speech
+python-dotenv
