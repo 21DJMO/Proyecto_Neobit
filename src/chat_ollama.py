@@ -1,13 +1,14 @@
 import requests
 import re
+from mission_manager import build_beginner_prompt
 
 OLLAMA_API_URL = "http://localhost:11434/api/chat"
-DEFAULT_MODEL  = "llama3.2"
+DEFAULT_MODEL  = "qwen3:4b"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SISTEMA DE RESPUESTA DUAL
 #   [HABLAR] → TTS de Azure  (conversación en inglés, sin etiquetas)
-#   [NOTA]   → pantalla      (correcciones en español)
+#   [NOTA]   → pantalla      (correcciones en español, solo al final)
 # ─────────────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPTS = {
@@ -17,20 +18,19 @@ The user's text comes from voice transcription. Focus on building confidence.
 
 STRICT RULES:
 1. [HABLAR]: ALWAYS in English. Max 2 short sentences. End with ONE simple yes/no question.
-2. [NOTA]: ALWAYS in Spanish. 
+2. [NOTA]: ALWAYS in Spanish. ONLY include if there is a clear grammar or vocabulary error.
    - Correct grammar (e.g., "I love play" -> "playing", "Colors is" -> "are").
    - If the user asks "Can you explain?", provide a very simple 1-sentence explanation here.
    - Include a simple phonetic guide for ONE tricky word from the user's input.
 3. MEMORY: If the user mentions a hobby or name, remember it for future questions.
-4. If no errors: write "¡Excelente trabajo!" and a small tip.
+4. CRITICAL RULE: If NO errors: leave [NOTA] completely EMPTY. Do NOT write any message like "No correction needed", "¡Excelente trabajo!", "Grammar OK", "Good sentence" or similar. Write absolutely nothing inside [NOTA].
 
 FORMAT:
 [HABLAR]
 (English reply + yes/no question)
 [/HABLAR]
 [NOTA]
-Gramática: (Corrección o ¡Sin errores!)
-Pronunciación: (Palabra [fonética-simple])
+(ONLY if error found: Spanish grammar/vocabulary correction. Otherwise COMPLETELY EMPTY.)
 [/NOTA]
 
 EXAMPLES:
@@ -41,6 +41,13 @@ Green is a beautiful color! Do you like nature?
 [NOTA]
 Gramática: Se usa "are" para plural: "My favorite colors are green and..."
 Pronunciación: Favorite [féi-vo-rit]
+[/NOTA]
+
+User: Hello, how are you?
+[HABLAR]
+I am great, thank you! Are you ready to order?
+[/HABLAR]
+[NOTA]
 [/NOTA]""",
 
     "intermedio": """You are a conversational English teacher for intermediate students (B1/B2 level).
@@ -48,21 +55,19 @@ You must act as a mentor who tracks progress and explains nuances.
 
 STRICT RULES:
 1. [HABLAR]: ALWAYS in English. Exactly 2 sentences: one natural reaction + one open-ended question.
-2. [NOTA]: ALWAYS in Spanish. 
+2. [NOTA]: ALWAYS in Spanish. ONLY include if there is a clear error.
    - Precision: Correct "explain me" to "explain to me" or "explain it to me". Correct "it is stressful" vs "I am stressed".
    - Explanations: If asked "Can you explain [word]?", provide a brief, clear definition here.
    - Pronunciation: Provide a phonetic guide for 1-2 advanced words used in the turn.
    - Memory: Use the chat history to ask about previously mentioned topics (family, work, location).
-3. If no errors: write "¡Muy fluido! Sigue así."
+3. CRITICAL RULE: If NO errors: leave [NOTA] completely EMPTY. Do NOT write any message.
 
 FORMAT:
 [HABLAR]
 (Reaction). (One open question)?
 [/HABLAR]
 [NOTA]
-Gramática: (Corrección detallada en español)
-Pronunciación: (Palabra [fonética-en-español])
-Progreso: (Menciona si usó una palabra nueva o si mejoró un error previo)
+(ONLY if error found: detailed Spanish correction. Otherwise COMPLETELY EMPTY.)
 [/NOTA]
 
 EXAMPLES:
@@ -83,20 +88,19 @@ Focus on idioms, natural flow, and sophisticated vocabulary.
 
 STRICT RULES:
 1. [HABLAR]: ALWAYS in English. 2-3 fluent sentences. Use ONE thought-provoking question.
-2. [NOTA]: ALWAYS in Spanish.
+2. [NOTA]: ALWAYS in Spanish. ONLY include if there is a clear error.
    - Only correct non-native phrasing or subtle logic errors.
    - Provide "How a native would say it" suggestions.
    - Phonetic guide for sophisticated vocabulary only.
 3. MEMORY: Deep context. If the user mentioned a specific problem or goal sessions ago, bring it up.
+4. CRITICAL RULE: If NO errors: leave [NOTA] completely EMPTY.
 
 FORMAT:
 [HABLAR]
 (Natural response + deep question)
 [/HABLAR]
 [NOTA]
-Estilo: (Sugerencia de naturalidad)
-Pronunciación: (Guía fonética para términos complejos)
-Contexto: (Referencia a temas pasados si aplica)
+(ONLY if error found: estilo suggestion. Otherwise COMPLETELY EMPTY.)
 [/NOTA]"""
 }
 
@@ -104,36 +108,69 @@ Contexto: (Referencia a temas pasados si aplica)
 def parse_response(raw_text: str) -> dict:
     """
     Extrae [HABLAR] y [NOTA] con regex.
-    Limpia cualquier etiqueta suelta que el modelo haya dejado fuera de los bloques.
+    Limpia bloques <think>...</think> de Qwen 3 antes de parsear.
     Fallback seguro si el modelo no respetó el formato.
     """
-    spoken_match = re.search(r'\[HABLAR\](.*?)\[/HABLAR\]', raw_text, re.DOTALL)
-    note_match   = re.search(r'\[NOTA\](.*?)\[/NOTA\]',     raw_text, re.DOTALL)
+    # Eliminar bloques de razonamiento interno de Qwen 3
+    clean_text = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL).strip()
+
+    spoken_match = re.search(r'\[HABLAR\](.*?)\[/HABLAR\]', clean_text, re.DOTALL)
+    note_match   = re.search(r'\[NOTA\](.*?)\[/NOTA\]',     clean_text, re.DOTALL)
+    mission_ended = bool(re.search(r'\[FIN\]', clean_text))
 
     spoken = spoken_match.group(1).strip() if spoken_match else ""
     note   = note_match.group(1).strip()   if note_match   else ""
 
     # Limpiar etiquetas sueltas que el modelo pudo haber dejado fuera
-    spoken = re.sub(r'\[/?(?:HABLAR|NOTA|HABLA)\]', '', spoken).strip()
-    note   = re.sub(r'\[/?(?:HABLAR|NOTA|HABLA)\]', '', note).strip()
+    spoken = re.sub(r'\[/?(?:HABLAR|NOTA|HABLA|FIN)\]', '', spoken).strip()
+    note   = re.sub(r'\[/?(?:HABLAR|NOTA|HABLA|FIN)\]', '', note).strip()
 
     # Fallback: si el modelo ignoró el formato completamente
     if not spoken:
-        spoken = re.sub(r'\[/?(?:HABLAR|NOTA|HABLA)\]', '', raw_text).strip()
+        spoken = re.sub(r'\[/?(?:HABLAR|NOTA|HABLA|FIN)\]', '', clean_text).strip()
         note = ""
 
-    return {"spoken": spoken, "note": note}
+    return {"spoken": spoken, "note": note, "mission_ended": mission_ended}
 
 
-def get_chat_response(user_text, model=DEFAULT_MODEL, chat_history=None, difficulty="intermedio"):
+def should_force_confirmation(user_text, chat_history):
+    # Extract all user texts and assistant texts from the history + current user_text
+    user_texts = [m.get("content", "").lower() for m in chat_history if m.get("role") == "user"] + [user_text.lower()]
+    assistant_texts = [m.get("content", "").lower() for m in chat_history if m.get("role") == "assistant"]
+    
+    joined_user = " ".join(user_texts)
+    joined_assistant = " ".join(assistant_texts)
+    joined_all = joined_user + " " + joined_assistant
+
+    # Check if food is selected (burger and fries mentioned)
+    food_selected = ("burger" in joined_all or "hamburger" in joined_all) and ("fries" in joined_all)
+
+    # Check if drink is selected
+    drink_triggers = ["drink", "tea", "coffee", "water", "cola", "coke", "soda", "juice", "lemonade", "beverage"]
+    drink_selected = any(d in joined_all for d in drink_triggers)
+
+    # Check if user is confirming the order in the current turn
+    confirm_triggers = ["your order is", "so that's", "so that is", "confirm", "that will be", "you ordered", "is that correct", "correct?", "is this correct", "so you want"]
+    user_confirming_now = any(c in user_text.lower() for c in confirm_triggers)
+
+    return food_selected and drink_selected and user_confirming_now
+
+
+def get_chat_response(user_text, model=DEFAULT_MODEL, chat_history=None, difficulty="básico", mission_data=None):
     """
     Retorna (dict, chat_history).
     dict tiene claves 'spoken' (para TTS) y 'note' (para pantalla).
+    Si mission_data está presente, construye el System Prompt dinámicamente de nivel principiante.
     """
     if chat_history is None:
         chat_history = []
 
-    system_prompt = SYSTEM_PROMPTS.get(difficulty, SYSTEM_PROMPTS["intermedio"])
+    if mission_data:
+        system_prompt = build_beginner_prompt(mission_data)
+        if mission_data.get("id") == "order_food" and should_force_confirmation(user_text, chat_history):
+            system_prompt += "\n\nCRITICAL CONTEXT: The user is confirming your order. Since food and drink are already selected, you must confirm that the order is correct. Reply with a short polite confirmation of the order (e.g., 'Yes, that's correct. Thank you.', 'That's right. Thank you very much.', or 'Perfect, thank you.'). Do NOT ask any questions, do NOT request any more information, and do NOT open any new topics. Keep it extremely brief and finish the roleplay."
+    else:
+        system_prompt = SYSTEM_PROMPTS.get(difficulty, SYSTEM_PROMPTS["básico"])
 
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(chat_history)
@@ -145,16 +182,21 @@ def get_chat_response(user_text, model=DEFAULT_MODEL, chat_history=None, difficu
         "stream": False,
         "options": {
             "temperature": 0.2,
-            "repeat_penalty": 1.2,   # Más alto para desincentivar repetir preguntas
+            "repeat_penalty": 1.1,
+            "num_ctx": 1024,      # Contexto reducido → mucho más rápido en CPU
         }
     }
 
-    print(f"\n[Ollama] ⏳ Procesando con '{model}' (nivel: {difficulty})...")
+    print(f"\n[Ollama] Procesando con '{model}' (nivel: {difficulty})...")
     try:
-        response = requests.post(OLLAMA_API_URL, json=payload)
+        response = requests.post(OLLAMA_API_URL, json=payload, timeout=180)
+        print(f"[Ollama] HTTP status: {response.status_code}")
         response.raise_for_status()
 
-        raw = response.json().get("message", {}).get("content", "").strip()
+        raw_json = response.json()
+        print(f"[Ollama] Respuesta JSON keys: {list(raw_json.keys())}")
+        raw = raw_json.get("message", {}).get("content", "").strip()
+        print(f"[Ollama] Raw content (primeros 200 chars): {raw[:200]}")
         parsed = parse_response(raw)
 
         # Historial: solo el bloque conversacional (no las notas de corrección)
@@ -169,13 +211,21 @@ def get_chat_response(user_text, model=DEFAULT_MODEL, chat_history=None, difficu
     except requests.exceptions.ConnectionError:
         fallback = {
             "spoken": "Sorry, I could not connect. Please make sure Ollama is running.",
-            "note": "❌ Error: Ollama no disponible."
+            "note": "Error de conexion: Ollama no esta disponible. Asegurate de que Ollama este corriendo con 'ollama serve'."
+        }
+        return fallback, chat_history
+    except requests.exceptions.ReadTimeout:
+        print(f"[Ollama] Timeout: el modelo tardo mas de 180 segundos.")
+        fallback = {
+            "spoken": "I am thinking... that took too long. Please try again.",
+            "note": "El modelo tardo demasiado en responder (timeout 180s). El modelo puede estar sobrecargado. Intenta de nuevo o reinicia Ollama."
         }
         return fallback, chat_history
     except Exception as e:
+        print(f"[Ollama] ERROR REAL: {type(e).__name__}: {str(e)}")
         fallback = {
             "spoken": "Something went wrong. Let's try again.",
-            "note": f"❌ Error: {str(e)}"
+            "note": f"Error: {type(e).__name__}: {str(e)}"
         }
         return fallback, chat_history
 

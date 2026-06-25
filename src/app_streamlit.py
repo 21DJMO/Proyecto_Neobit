@@ -3,10 +3,11 @@ import streamlit.components.v1 as components
 import numpy as np
 import time
 import os
+import textwrap
 
 # Asegurar que el directorio src está en el path para importaciones limpias
 import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Importar pipelines existentes
 from audio_capture import StreamlitRecorder
@@ -16,11 +17,15 @@ from chat_ollama import get_chat_response
 from tts_azure import init_speech_synthesizer, speak_text
 from mission_manager import get_available_missions, get_mission_by_id
 
+# ---------- Evaluación y feedback específico para la misión `order_food` ----------
 import re
-import textwrap
 
 
 def evaluate_order_food_objectives(messages):
+    """Detecta los micro-objetivos completados por el usuario en la conversación.
+    Examina TODOS los mensajes, tanto del usuario como del asistente.
+    Retorna un dict con booleanos para cada objetivo.
+    """
     user_texts = [m.get("content", "").lower() for m in messages if m.get("role") == "user"]
     assistant_texts = [m.get("spoken", "").lower() for m in messages if m.get("role") == "assistant"]
     joined_user = " ".join(user_texts)
@@ -35,8 +40,14 @@ def evaluate_order_food_objectives(messages):
     drink_selected = any(d in joined_all for d in drink_triggers)
 
     # 3. Order confirmed: waiter confirms order details
-    confirm_triggers = ["your order is", "so that's", "so that is", "confirm", "that will be", "you ordered", "is that correct", "correct?", "is this correct", "so you want"]
-    order_confirmed = any(c in joined_user for c in confirm_triggers) and ("burger" in joined_user or "hamburger" in joined_user or "fries" in joined_user or "drink" in joined_user or "tea" in joined_user or "coke" in joined_user or "soda" in joined_user)
+    confirm_triggers = [
+        "your order is", "so that's", "so that is", "confirm", "that will be",
+        "you ordered", "is that correct", "correct?", "is this correct", "so you want",
+        # afirmaciones del waiter sin signo de pregunta
+        "that's correct", "that is correct", "that's right", "that is right",
+        "perfect, your order", "so your order", "your new order",
+    ]
+    order_confirmed = any(c in joined_user for c in confirm_triggers) and ("burger" in joined_user or "hamburger" in joined_user or "fries" in joined_user or "drink" in joined_user or "tea" in joined_user or "coke" in joined_user or "soda" in joined_user or "water" in joined_user or "juice" in joined_user)
 
     return {
         "food_selected": food_selected,
@@ -51,36 +62,87 @@ def check_client_confirmation(spoken_text):
     return any(p in text for p in confirmation_phrases)
 
 
+def check_mission_end(spoken_text):
+    """
+    Detecta si Neobit dio una respuesta de cierre real en este turno exacto.
+    Solo evalúa el turno actual — no el historial previo — para evitar
+    falsos positivos por frases acumuladas en turnos anteriores.
+    """
+    text = spoken_text.lower()
+    end_phrases = [
+        "goodbye", "bye", "see you",
+        "enjoy your meal", "enjoy your food",
+        "i'll wait", "great, i'll wait", "great, thank you",
+        "thank you for confirming", "i will wait",
+    ]
+    return any(p in text for p in end_phrases)
+
+
+def has_natural_closure(messages, lookback=3):
+    """Detecta si la conversación tiene un cierre natural.
+    Revisa los últimos mensajes del usuario Y del asistente.
+    No depende de frases exactas - usa matching flexible.
+    """
+    recent = messages[-lookback:] if len(messages) >= lookback else messages
+    user_recent = " ".join([
+        m.get("content", "").lower() for m in recent if m.get("role") == "user"
+    ])
+    assistant_recent = " ".join([
+        m.get("spoken", "").lower() for m in recent if m.get("role") == "assistant"
+    ])
+    combined = user_recent + " " + assistant_recent
+
+    # Frases de cierre naturales - flexibles
+    closure_phrases = [
+        "thank you", "thanks", "thank you so much",
+        "have a nice day", "have a good day", "have a good one",
+        "goodbye", "bye", "bye bye",
+        "see you later", "see you", "see you soon",
+        "you're welcome", "you are welcome", "youre welcome",
+        "enjoy your meal", "enjoy", "enjoy your food",
+        "take care",
+        "you too",
+        "come again", "come back soon",
+        "have fun", "talk to you later",
+        "that will be all", "that's all", "i'm done", "i am done",
+        "perfect", "perfect thank you", "thanks for your help"
+    ]
+    return any(phrase in combined for phrase in closure_phrases)
+
+
 def analyze_conversation(messages, vocab_goals=None):
     """Analiza la conversación completa y prepara un feedback final.
-    Revisa cada intervención del usuario y reporta correcciones claras con
-    alternativas más naturales y explicaciones breves.
+    Revisa CADA intervención del usuario individualmente.
+    Reporta correcciones claras con alternativas más naturales y explicaciones breves.
     """
     user_texts = [m.get("content", "") for m in messages if m.get("role") == "user"]
     joined = " \n".join(user_texts).strip()
 
     corrections = []
+    better_alternatives = []
     vocab_used = []
     strengths = []
     suggestions = []
 
     lower_joined = joined.lower()
 
+    # Detectar vocabulario usado
     if vocab_goals:
         for v in vocab_goals:
             if re.search(rf"\b{re.escape(v)}\b", lower_joined, re.IGNORECASE):
                 vocab_used.append(v)
 
+    # ── Reglas de corrección gramatical ──
     pattern_rules = [
         {
-            "regex": r"\bwould you like to some fries\b",
-            "corrected": "Would you like some fries?",
+            "regex": r"\bwould you like to some\b",
+            "corrected": "Would you like some",
             "explanation": "After 'Would you like' we do not use 'to'."
         },
         {
-            "regex": r"\bthat's sounds good\b",
-            "corrected": "That sounds good.",
-            "explanation": "Use 'That sounds good' instead of 'That's sounds good'."
+            "regex": r"\bthat's sounds\b",
+            "corrected": "That sounds",
+            "explanation": "Use 'That sounds' instead of 'That's sounds'."
         },
         {
             "regex": r"\bhamburguer\b",
@@ -88,8 +150,8 @@ def analyze_conversation(messages, vocab_goals=None):
             "explanation": "The correct spelling is 'hamburger'."
         },
         {
-            "regex": r"\bin \d+ minutes you received your order\b",
-            "corrected": "In 10 minutes you will receive your order.",
+            "regex": r"\bin \d+ minutes you received\b",
+            "corrected": "In X minutes you will receive",
             "explanation": "Use future tense for an action that will happen later."
         },
         {
@@ -103,10 +165,25 @@ def analyze_conversation(messages, vocab_goals=None):
             "explanation": "Use 'Would you like a drink' instead of 'Would you like to a drink'."
         },
         {
-            "regex": r"\bwould you like to drink\b",
-            "corrected": "Would you like a drink?",
-            "explanation": "Use 'a drink' after 'Would you like'."
-        }
+            "regex": r"\byou is\b",
+            "corrected": "You are",
+            "explanation": "Use 'you are' instead of 'you is'."
+        },
+        {
+            "regex": r"\bhe don't\b",
+            "corrected": "He doesn't",
+            "explanation": "Use 'doesn't' with third person singular (he/she/it)."
+        },
+        {
+            "regex": r"\bshe don't\b",
+            "corrected": "She doesn't",
+            "explanation": "Use 'doesn't' with third person singular (he/she/it)."
+        },
+        {
+            "regex": r"\bit's sound\b",
+            "corrected": "It sounds",
+            "explanation": "Use 'It sounds' instead of 'It's sound'."
+        },
     ]
 
     common_errors = [
@@ -124,7 +201,17 @@ def analyze_conversation(messages, vocab_goals=None):
             "regex": r"\byou see her\b",
             "corrected": "did you see her",
             "explanation": "Use a question structure with 'did' for clarity."
-        }
+        },
+        {
+            "regex": r"\bI want\b",
+            "corrected": "I would like",
+            "explanation": "'I would like' is more polite in a restaurant."
+        },
+        {
+            "regex": r"\bgive me\b",
+            "corrected": "Could I have",
+            "explanation": "'Could I have' is more polite than 'Give me'."
+        },
     ]
 
     misspellings = {
@@ -132,20 +219,64 @@ def analyze_conversation(messages, vocab_goals=None):
         "friees": "fries",
         "recieve": "receive",
         "restaurnt": "restaurant",
-        "waite": "waiter"
+        "waite": "waiter",
+        "drinck": "drink",
+        "pleez": "please",
+        "thak you": "thank you",
     }
 
+    # ── Mejores alternativas para sonar más natural ──
+    alternative_rules = [
+        {
+            "regex": r"\bwhat do you drink\b",
+            "alternative": "What would you like to drink?",
+            "reason": "This sounds more natural and polite in a restaurant."
+        },
+        {
+            "regex": r"\bwhat you want\b",
+            "alternative": "What would you like?",
+            "reason": "More polite and natural for a waiter."
+        },
+        {
+            "regex": r"\byou want what\b",
+            "alternative": "What would you like?",
+            "reason": "More natural word order for a question."
+        },
+        {
+            "regex": r"\bhow long you want\b",
+            "alternative": "How long would you like to wait?",
+            "reason": "Sounds more natural and complete."
+        },
+        {
+            "regex": r"\bI want burger\b",
+            "alternative": "I would like a burger.",
+            "reason": "Using 'I would like' is more polite."
+        },
+        {
+            "regex": r"\bgive me burger\b",
+            "alternative": "Could I have a burger, please?",
+            "reason": "Much more polite and natural."
+        },
+    ]
+
+    # Revisar cada mensaje individualmente
     for msg in user_texts:
         original = msg.strip()
         lower_msg = original.lower()
+        if not original:
+            continue
 
+        # Correcciones gramaticales
         for rule in pattern_rules:
             if re.search(rule["regex"], lower_msg, re.IGNORECASE):
-                corrections.append({
-                    "original": original,
-                    "corrected": rule["corrected"],
-                    "explanation": rule["explanation"]
-                })
+                # Generar corrección específica para este caso
+                corrected = re.sub(rule["regex"], rule["corrected"], original, flags=re.IGNORECASE)
+                if corrected != original:
+                    corrections.append({
+                        "original": original,
+                        "corrected": corrected,
+                        "explanation": rule["explanation"]
+                    })
 
         for err in common_errors:
             if re.search(err["regex"], lower_msg, re.IGNORECASE):
@@ -157,6 +288,7 @@ def analyze_conversation(messages, vocab_goals=None):
                         "explanation": err["explanation"]
                     })
 
+        # Ortografía
         for bad, good in misspellings.items():
             if re.search(rf"\b{re.escape(bad)}\b", lower_msg):
                 corrected = re.sub(rf"\b{re.escape(bad)}\b", good, original, flags=re.IGNORECASE)
@@ -164,45 +296,96 @@ def analyze_conversation(messages, vocab_goals=None):
                     corrections.append({
                         "original": original,
                         "corrected": corrected,
-                        "explanation": f"Ortografía: '{good}' es la forma correcta."
+                        "explanation": f"Spelling: '{good}' is the correct form."
                     })
 
+        # Mejores alternativas
+        for alt in alternative_rules:
+            if re.search(alt["regex"], lower_msg, re.IGNORECASE):
+                better_alternatives.append({
+                    "original": original,
+                    "alternative": alt["alternative"],
+                    "reason": alt["reason"]
+                })
+
+    # Eliminar duplicados de correcciones
     unique_corrections = {}
     for c in corrections:
         key = (c["original"], c["corrected"])
         unique_corrections[key] = c
     corrections = list(unique_corrections.values())
 
+    # Eliminar duplicados de alternativas
+    unique_alternatives = {}
+    for a in better_alternatives:
+        key = (a["original"], a["alternative"])
+        unique_alternatives[key] = a
+    better_alternatives = list(unique_alternatives.values())
+
+    # Fortalezas
     if vocab_used:
         strengths.append("Used mission vocabulary naturally.")
     if len(user_texts) >= 3:
         strengths.append("Maintained a multi-turn interaction.")
+    if len(user_texts) >= 5:
+        strengths.append("Extended conversation with multiple exchanges.")
+    if not corrections:
+        strengths.append("Excellent grammar throughout the conversation.")
+    if better_alternatives:
+        strengths.append("Good effort in communicating your needs.")
     if not strengths:
         strengths.append("The interaction was concise and focused.")
 
+    # Cálculo de puntuación
     real_corrections = [c for c in corrections if c.get("original") and c.get("corrected")]
     missing_vocab = max(0, 5 - len(vocab_used))
-    score = 100 - len(real_corrections) * 8 - missing_vocab * 3
-    score = max(60, min(100, score))
+    score = 100 - len(real_corrections) * 10 - len(better_alternatives) * 5 - missing_vocab * 3
+    score = max(55, min(100, score))
 
+    # Sugerencias
+    suggestions = []
     if real_corrections:
-        suggestions.append("Review the corrections and try to use the suggested alternatives in the next roleplay.")
-    else:
-        corrections.append({
-            "original": "No relevant errors were detected in the final conversation.",
-            "corrected": "",
-            "explanation": "The final dialogue is clear and appropriate."
-        })
-        suggestions.append("No relevant errors were detected in the final conversation.")
-        suggestions.append("Great work — continue practicing to build confidence.")
+        suggestions.append("Review the grammar corrections above and practice the correct forms.")
+    if better_alternatives:
+        suggestions.append("Try using the suggested alternatives to sound more natural.")
+    if missing_vocab > 0 and vocab_goals:
+        target_words = [v for v in vocab_goals if v not in vocab_used]
+        suggestions.append(f"Try using these target words: {', '.join(target_words)}.")
+    if not real_corrections and not better_alternatives:
+        suggestions.append("Great work! Keep practicing to build confidence and fluency.")
+    if not suggestions:
+        suggestions.append("Continue practicing to improve your fluency.")
 
     return {
         "score": score,
         "corrections": corrections,
+        "better_alternatives": better_alternatives,
         "vocab_used": vocab_used,
         "strengths": strengths,
         "suggestions": suggestions
     }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FAREWELL PHRASES — detección de despedida del usuario para cierre de misión
+# ─────────────────────────────────────────────────────────────────────────────
+FAREWELL_PHRASES = [
+    # Despedidas directas
+    "goodbye", "bye", "bye bye", "see you", "see you later", "see you soon",
+    "take care", "have a nice day", "have a good day", "have a good one",
+    "have a great day", "have a nice evening", "have a wonderful day",
+    "have a wonderful evening",
+    # Cierre del servicio — waiter
+    "thank you for your order", "thanks for your order",
+    "thank you for your purchase", "thank you for visiting",
+    "thank you for coming", "thanks for coming",
+    "enjoy your meal", "enjoy your food", "enjoy your dinner", "enjoy your lunch",
+    "your food will be ready", "we will bring it", "we'll bring it",
+    "your order is on its way", "come back soon", "come again",
+    "see you next time", "that's all for now", "that is all for now",
+    # Cierre natural de conversación
+    "have a good rest", "have a good evening", "all done", "we're all set",
+    "we are all set", "you're all set", "you are all set",
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. CONFIGURACIÓN DE LA PÁGINA Y ESTILOS PREMIUM (CSS CUSTOM)
@@ -214,7 +397,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Inyección de estilos CSS premium (Aesthetics: High contrast, Outfit typography, refined cards)
+# Inyección de estilos CSS premium
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap');
@@ -224,7 +407,7 @@ st.markdown("""
         font-family: 'Outfit', sans-serif;
     }
     
-    /* Título principal con degradado premium de alta legibilidad */
+    /* Título principal con degradado premium */
     .premium-title {
         background: linear-gradient(135deg, #1e3a8a 0%, #4f46e5 100%);
         -webkit-background-clip: text;
@@ -241,7 +424,7 @@ st.markdown("""
         margin-bottom: 25px;
     }
     
-    /* Tarjeta de Briefing estilo Premium con excelente contraste */
+    /* Tarjeta de Briefing */
     .briefing-card {
         background-color: #ffffff;
         border: 2px solid #cbd5e1;
@@ -273,7 +456,7 @@ st.markdown("""
         color: #0f172a;
     }
     
-    /* Badges para los objetivos de vocabulario de alta visibilidad */
+    /* Badges para vocabulario */
     .vocab-badge {
         display: inline-block;
         padding: 6px 12px;
@@ -287,31 +470,127 @@ st.markdown("""
         margin-bottom: 6px;
     }
     
-    /* Caja de Sugerencia de Gramática Educativa Premium (Solo si hay errores) */
-    .feedback-box {
-        background-color: #fff7ed;
-        border-left: 5px solid #f97316;
-        border-radius: 8px;
-        padding: 16px;
-        margin-top: 12px;
-        box-shadow: 0 2px 8px rgba(249, 115, 22, 0.05);
+    /* Modal de Misión Completada */
+    .mission-complete-modal {
+        background: linear-gradient(135deg, #f0fdf4 0%, #ffffff 100%);
+        border: 3px solid #10b981;
+        border-radius: 24px;
+        padding: 32px;
+        margin-bottom: 24px;
+        box-shadow: 0 20px 40px rgba(16, 185, 129, 0.15);
+        text-align: center;
+    }
+    .mission-complete-modal h1 {
+        color: #065f46;
+        font-size: 2.2rem;
+        font-weight: 800;
+        margin-bottom: 4px;
+    }
+    .mission-complete-modal .subtitle {
+        color: #047857;
+        font-size: 1.1rem;
+        margin-bottom: 16px;
+    }
+    .mission-complete-modal .score-badge {
+        display: inline-block;
+        background: #10b981;
+        color: white;
+        font-size: 2.5rem;
+        font-weight: 800;
+        border-radius: 50%;
+        width: 100px;
+        height: 100px;
+        line-height: 100px;
+        margin: 12px auto;
+        box-shadow: 0 8px 16px rgba(16, 185, 129, 0.3);
+    }
+    .mission-complete-modal .view-results-btn {
+        background: #10b981;
+        color: white;
+        border: none;
+        padding: 12px 32px;
+        border-radius: 12px;
+        font-size: 1.1rem;
+        font-weight: 700;
+        cursor: pointer;
+        margin-top: 16px;
+        transition: all 0.2s;
+    }
+    .mission-complete-modal .view-results-btn:hover {
+        background: #059669;
+        transform: translateY(-2px);
     }
     
-    .feedback-header {
-        color: #c2410c;
+    /* Tarjeta de Reporte Profesional */
+    .report-card {
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-radius: 24px;
+        padding: 28px;
+        margin-bottom: 24px;
+        box-shadow: 0 18px 30px rgba(15, 23, 42, 0.05);
+    }
+    .report-card h3 {
+        color: #1e293b;
         font-weight: 700;
-        font-size: 1rem;
-        margin-bottom: 6px;
+        font-size: 1.2rem;
+        margin-bottom: 12px;
         display: flex;
         align-items: center;
-        gap: 6px;
+        gap: 8px;
     }
-    
-    .feedback-item {
+    .report-card .section-divider {
+        height: 1px;
+        background: #e2e8f0;
+        margin: 20px 0;
+    }
+    .objectives-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+    }
+    .objective-item {
+        padding: 6px 0;
         font-size: 0.95rem;
-        color: #7c2d12;
-        line-height: 1.5;
     }
+    .objective-item .check { color: #10b981; font-weight: 700; }
+    .objective-item .cross { color: #ef4444; font-weight: 700; }
+    
+    .correction-item {
+        padding: 12px;
+        background: #fefce8;
+        border-left: 4px solid #eab308;
+        border-radius: 8px;
+        margin-bottom: 10px;
+    }
+    .correction-item .label { font-weight: 600; color: #1e293b; }
+    .correction-item .original-text { color: #b91c1c; text-decoration: line-through; }
+    .correction-item .corrected-text { color: #15803d; font-weight: 600; }
+    .correction-item .explanation { color: #64748b; font-size: 0.9rem; margin-top: 4px; }
+    
+    .alternative-item {
+        padding: 12px;
+        background: #f0f9ff;
+        border-left: 4px solid #0ea5e9;
+        border-radius: 8px;
+        margin-bottom: 10px;
+    }
+    .alternative-item .label { font-weight: 600; color: #1e293b; }
+    .alternative-item .orig-text { color: #64748b; }
+    .alternative-item .alt-text { color: #0369a1; font-weight: 600; }
+    .alternative-item .reason { color: #64748b; font-size: 0.9rem; margin-top: 4px; }
+    
+    .strength-item {
+        padding: 6px 0;
+        color: #065f46;
+    }
+    .strength-item::before { content: "✨ "; }
+    
+    .suggestion-item {
+        padding: 6px 0;
+        color: #1e293b;
+    }
+    .suggestion-item::before { content: "💡 "; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -375,6 +654,10 @@ if "mission_objectives" not in st.session_state:
 if "mission_feedback" not in st.session_state:
     st.session_state.mission_feedback = None
 
+# Control para mostrar/ocultar el reporte detallado
+if "show_report" not in st.session_state:
+    st.session_state.show_report = False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. BARRA LATERAL (SIDEBAR DE CONTROL)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -411,111 +694,168 @@ with st.sidebar:
     # Obtener metadatos de la misión activa
     active_mission = get_mission_by_id(selected_mission_id)
     
-    # Detectar si el usuario cambió de misión para limpiar historial e iniciar fresca la simulación
+    # Detectar si el usuario cambió de misión para limpiar historial
     if st.session_state.active_mission_id != selected_mission_id:
         st.session_state.active_mission_id = selected_mission_id
-        st.session_state.messages = []
-        st.session_state.ollama_history = []
         st.session_state.used_vocabulary = set()
         st.session_state.mission_completed = False
         st.session_state.corrections_summary = []
+        st.session_state.show_report = False
         if "balloons_triggered" in st.session_state:
             del st.session_state.balloons_triggered
-        # Saludo inicial in character (opcional pero le da vida)
-        initial_greeting = {
-            "role": "assistant",
-            "spoken": f"Hello! Let's start our scenario. I am ready to play my role.",
-            "note": ""
-        }
-        st.session_state.messages.append(initial_greeting)
+        # Inyectar starter_line como primer turno fijo de Neobit
+        starter_line = active_mission.get("starter_line", "Hello! I would like to order, please.") if active_mission else "Hello! I am ready to start."
+        st.session_state.messages = [{"role": "assistant", "spoken": starter_line, "note": ""}]
+        st.session_state.ollama_history = [{"role": "assistant", "content": starter_line}]
         
     st.markdown("---")
     # Botón para limpiar historial
     if st.button("🔄 Reiniciar Misión", use_container_width=True):
-        st.session_state.messages = [
-            {
-                "role": "assistant",
-                "spoken": "Hello! I am ready to start again. Speak when you are ready.",
-                "note": ""
-            }
-        ]
-        st.session_state.ollama_history = []
+        starter_line = active_mission.get("starter_line", "Hello! I would like to order, please.") if active_mission else "Hello! I am ready to start."
+        st.session_state.messages = [{"role": "assistant", "spoken": starter_line, "note": ""}]
+        st.session_state.ollama_history = [{"role": "assistant", "content": starter_line}]
         st.session_state.used_vocabulary = set()
         st.session_state.mission_completed = False
         st.session_state.corrections_summary = []
+        st.session_state.show_report = False
         if "balloons_triggered" in st.session_state:
             del st.session_state.balloons_triggered
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. CONTENIDO PRINCIPAL Y BRIEFING CARD
+# 5. CONTENIDO PRINCIPAL
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown('<div class="premium-title">🚀 Neobit Roleplay English Coach</div>', unsafe_allow_html=True)
 st.markdown('<div class="premium-subtitle">Resuelve situaciones reales del día a día conversando en inglés con Neobit en nivel principiante.</div>', unsafe_allow_html=True)
 
-# Banner de felicitación y tarjeta de evaluación cuando la misión se completa
+# ── MODAL DE MISIÓN COMPLETADA ──
 if st.session_state.mission_completed:
     feedback = st.session_state.get("mission_feedback") or {}
-    # Render a concise completion header
+    score = feedback.get("score", 0)
+    
+    # Modal visual de "Misión Completada"
     st.markdown(f"""
-    <div style="background-color: #d1fae5; border: 2px solid #10b981; border-radius: 12px; padding: 18px; text-align: left; margin-bottom: 18px;">
-        <h2 style="color: #065f46; margin: 0; font-size: 1.6rem; font-weight: 700;">🎉 Misión completada</h2>
-        <div style="color: #065f46; margin-top:6px; font-size:0.98rem;">Buen trabajo. Aquí tienes una evaluación práctica y clara de tu desempeño.</div>
+    <div class="mission-complete-modal">
+        <h1>🎉 Mission Completed!</h1>
+        <div class="subtitle">You successfully completed the roleplay conversation.</div>
+        <div class="score-badge">{score}%</div>
+        <div style="color: #065f46; font-size: 0.95rem; margin-top: 8px;">Overall Score</div>
+        <br/>
     </div>
     """, unsafe_allow_html=True)
-
-    # Show the evaluation card if available
-    if feedback:
-        score = feedback.get("score", 0)
+    
+    # Botón para ver reporte detallado
+    col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
+    with col_btn2:
+        if not st.session_state.show_report:
+            if st.button("📊 View Detailed Results", type="primary", use_container_width=True):
+                st.session_state.show_report = True
+                st.rerun()
+        else:
+            if st.button("🔽 Hide Detailed Results", type="secondary", use_container_width=True):
+                st.session_state.show_report = False
+                st.rerun()
+    
+    # Reporte detallado
+    if st.session_state.show_report and feedback:
         objectives = feedback.get("objectives", {})
         corrections = feedback.get("corrections", [])
+        better_alternatives = feedback.get("better_alternatives", [])
         strengths = feedback.get("strengths", [])
         vocab_used = feedback.get("vocab_used", [])
         suggestions = feedback.get("suggestions", [])
-
+        
+        # ── Objetivos ──
         objectives_html = ""
         for k, v in objectives.items():
-            mark = "✅" if v else "❌"
-            objectives_html += f'<li style="margin-bottom:6px;">{mark} <strong>{k.replace("_"," ").capitalize()}</strong></li>'
+            display_name = k.replace("_", " ").capitalize()
+            mark = '<span class="check">✓</span>' if v else '<span class="cross">✗</span>'
+            objectives_html += f'<div class="objective-item">{mark} <strong>{display_name}</strong></div>'
+        
+        # ── Correcciones ──
         corrections_html = ""
-        for c in corrections:
-            original = c.get("original", "")
-            corrected = c.get("corrected", "")
-            explanation = c.get("explanation", "")
-            if corrected:
-                corrections_html += f"<li style=\"margin-bottom:8px;\"><strong>Original:</strong> {original}<br/><strong>Corrected:</strong> {corrected}<br/><small>{explanation}</small></li>"
-            else:
-                corrections_html += f"<li style=\"margin-bottom:8px;\"><strong>{original}</strong><br/><small>{explanation}</small></li>"
-        strengths_html = "".join([f"<li style=\"margin-bottom:6px;\">{s}</li>" for s in strengths])
-        vocab_html = ", ".join(vocab_used) if vocab_used else "-"
-
+        if corrections:
+            for c in corrections:
+                original = c.get("original", "")
+                corrected = c.get("corrected", "")
+                explanation = c.get("explanation", "")
+                corrections_html += f"""
+                <div class="correction-item">
+                    <div><span class="label">Original:</span> <span class="original-text">{original}</span></div>
+                    <div><span class="label">Corrected:</span> <span class="corrected-text">{corrected}</span></div>
+                    <div class="explanation">{explanation}</div>
+                </div>
+                """
+        else:
+            corrections_html = '<div style="color: #64748b; padding: 12px;">No grammar errors detected. Great job!</div>'
+        
+        # ── Better Alternatives ──
+        alternatives_html = ""
+        if better_alternatives:
+            for a in better_alternatives:
+                original = a.get("original", "")
+                alternative = a.get("alternative", "")
+                reason = a.get("reason", "")
+                alternatives_html += f"""
+                <div class="alternative-item">
+                    <div><span class="label">You said:</span> <span class="orig-text">{original}</span></div>
+                    <div><span class="label">Better:</span> <span class="alt-text">{alternative}</span></div>
+                    <div class="reason">{reason}</div>
+                </div>
+                """
+        else:
+            alternatives_html = '<div style="color: #64748b; padding: 12px;">Your phrasing was natural and appropriate.</div>'
+        
+        # ── Strengths ──
+        strengths_html = "".join([f'<div class="strength-item">{s}</div>' for s in strengths])
+        
+        # ── Vocabulario ──
+        vocab_html = ", ".join(vocab_used) if vocab_used else "<span style='color: #94a3b8;'>None of the target vocabulary was detected.</span>"
+        
+        # ── Sugerencias ──
+        suggestions_html = "".join([f'<div class="suggestion-item">{s}</div>' for s in suggestions])
+        
+        # Renderizar reporte completo
         st.markdown(f"""
-        <div class="briefing-card" style="border-left: 4px solid #0ea5a4; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 24px; padding: 20px; box-shadow: 0 18px 30px rgba(15, 23, 42, 0.05);">
-            <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
-                <div style="font-weight:700; font-size:1.2rem;">Evaluación de la misión</div>
-                <div style="font-size:1.6rem; color:#065f46; font-weight:800;">{score}%</div>
+        <div class="report-card">
+            <h3>📋 Overall Score</h3>
+            <div style="font-size: 2rem; font-weight: 800; color: #065f46;">{score}%</div>
+            
+            <div class="section-divider"></div>
+            
+            <h3>✅ Objectives Completed</h3>
+            <div class="objectives-grid">
+                {objectives_html}
             </div>
-            <div style="margin-top:16px; display:flex; gap:20px; flex-wrap:wrap;">
-                <div style="flex:1; min-width:220px;">
-                    <div style="font-weight:700; margin-bottom:6px;">Objetivos logrados</div>
-                    <ul style="padding-left:18px; margin-top:6px;">{objectives_html}</ul>
-                </div>
-                <div style="flex:1; min-width:220px;">
-                    <div style="font-weight:700; margin-bottom:6px;">Lo que hiciste bien</div>
-                    <ul style="padding-left:18px; margin-top:6px;">{strengths_html}</ul>
-                    <div style="margin-top:10px; font-weight:700;">Vocabulario usado</div>
-                    <div style="margin-top:6px;">{vocab_html}</div>
-                </div>
-            </div>
-            <div style="margin-top:18px;">
-                <div style="font-weight:700; margin-bottom:6px;">Correcciones y formas más naturales</div>
-                <ul style="padding-left:18px;">{corrections_html}</ul>
-            </div>
-            <div style="margin-top:14px; font-weight:700;">Sugerencias</div>
-            <div style="margin-top:6px;">{(' ').join(suggestions)}</div>
+            
+            <div class="section-divider"></div>
+            
+            <h3>✏️ Grammar Corrections</h3>
+            {corrections_html}
+            
+            <div class="section-divider"></div>
+            
+            <h3>💬 Better Alternatives</h3>
+            {alternatives_html}
+            
+            <div class="section-divider"></div>
+            
+            <h3>✨ What You Did Well</h3>
+            {strengths_html}
+            
+            <div class="section-divider"></div>
+            
+            <h3>📖 Vocabulary Used</h3>
+            <div style="margin-bottom: 16px;">{vocab_html}</div>
+            
+            <div class="section-divider"></div>
+            
+            <h3>💡 Suggestions for Improvement</h3>
+            {suggestions_html}
         </div>
         """, unsafe_allow_html=True)
-
+    
+    # Balloons solo una vez
     if "balloons_triggered" not in st.session_state:
         st.session_state.balloons_triggered = True
         st.balloons()
@@ -530,7 +870,7 @@ if active_mission and not st.session_state.mission_completed:
             box-shadow: 0 4px 20px rgba(15,23,42,0.06);">
 """, unsafe_allow_html=True)
 
-    # ── Row 1: Mission title ──
+    # ── Mission title ──
     st.markdown(
         f"<div style='font-size:1.15rem; font-weight:800; color:#4f46e5; "
         f"margin-bottom:14px;'>📍 {active_mission.get('title', 'Mission')}</div>",
@@ -541,23 +881,16 @@ if active_mission and not st.session_state.mission_completed:
         col_left, col_right = st.columns(2, gap="large")
 
         with col_left:
-            # 🎭 Your Role
             st.markdown("**🎭 Your Role**")
-            st.markdown(
-                f"> {active_mission.get('user_role', '')}",
-            )
+            st.markdown(f"> {active_mission.get('user_role', '')}")
 
             st.markdown("&nbsp;", unsafe_allow_html=True)
 
-            # 🎯 Your Mission
             st.markdown("**🎯 Your Mission**")
-            st.markdown(
-                "> Take the customer's order and complete the service politely."
-            )
+            st.markdown("> Take the customer's order and complete the service politely.")
 
             st.markdown("&nbsp;", unsafe_allow_html=True)
 
-            # 💡 Suggested Flow
             st.markdown("**💡 Suggested Flow**")
             st.markdown(
                 "1. Greet the customer  \n"
@@ -565,10 +898,10 @@ if active_mission and not st.session_state.mission_completed:
                 "3. Ask what they want to drink  \n"
                 "4. Confirm the order  \n"
                 "5. Finish politely"
+                
             )
 
         with col_right:
-            # 🗣 Useful Phrases
             st.markdown("**🗣 Useful Phrases**")
             st.markdown(
                 "• *Welcome to our restaurant.*  \n"
@@ -580,7 +913,6 @@ if active_mission and not st.session_state.mission_completed:
 
             st.markdown("&nbsp;", unsafe_allow_html=True)
 
-            # 🎯 Vocabulary Goals (native badges via columns)
             vocab_goals = active_mission.get("vocabulary_goals", [])
             if vocab_goals:
                 st.markdown("**🎯 Vocabulary Goals**")
@@ -595,7 +927,6 @@ if active_mission and not st.session_state.mission_completed:
 
         st.markdown("&nbsp;", unsafe_allow_html=True)
 
-        # ── Mission Details expander (collapsed by default) ──
         with st.expander("📖 Mission Details", expanded=False):
             st.markdown("**📋 Full Scenario**")
             st.info(active_mission.get("narrative_context", ""))
@@ -630,6 +961,7 @@ if active_mission and not st.session_state.mission_completed:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. HISTORIAL DE CONVERSACIÓN DE CHAT (VISUAL)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -643,10 +975,8 @@ with chat_container:
         else:
             with st.chat_message("assistant", avatar="🤖"):
                 st.write(msg["spoken"])
-                # Las correcciones de gramática NO se muestran durante la conversación.
-                # Se acumulan silenciosamente y solo aparecen en el resumen al completar la misión.
-
-# Suggestion system removed — guidance is provided only in mission briefing before start.
+                # Las correcciones [NOTA] NO se muestran durante la conversación.
+                # Nunca aparecen mensajes como "No correction needed", "Grammar OK", etc.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. CAPA DE INTERACCIÓN POR VOZ (CONTROLES DE AUDIO)
@@ -661,17 +991,13 @@ with col2:
     if st.session_state.mission_completed:
         st.write("<div style='text-align: center; font-weight: 600; color: #10b981; margin-bottom: 15px;'>🏆 MISIÓN COMPLETADA CON ÉXITO</div>", unsafe_allow_html=True)
         if st.button("🔄 Jugar Otra Misión (Reiniciar)", type="primary", use_container_width=True):
-            st.session_state.messages = [
-                {
-                    "role": "assistant",
-                    "spoken": "Hello! I am ready to start again. Speak when you are ready.",
-                    "note": ""
-                }
-            ]
-            st.session_state.ollama_history = []
+            starter_line = active_mission.get("starter_line", "Hello! I would like to order, please.") if active_mission else "Hello! I am ready to start."
+            st.session_state.messages = [{"role": "assistant", "spoken": starter_line, "note": ""}]
+            st.session_state.ollama_history = [{"role": "assistant", "content": starter_line}]
             st.session_state.used_vocabulary = set()
             st.session_state.mission_completed = False
             st.session_state.corrections_summary = []
+            st.session_state.show_report = False
             if "balloons_triggered" in st.session_state:
                 del st.session_state.balloons_triggered
             st.rerun()
@@ -690,29 +1016,29 @@ with col2:
                 audio_data = st.session_state.recorder.stop()
                 
             if audio_data is not None and len(audio_data) > 0:
-                # ── PASO 1: VAD (Detección de voz activa) ───────────────────
+                # ── PASO 1: VAD ──
                 with st.spinner("🔍 Analizando voz con Silero VAD..."):
                     timestamps = detect_speech(audio_data, vad_model, vad_utils, fs=16000)
                 
                 if not timestamps:
                     st.warning("⚠️ No se detectó voz clara. ¡Asegúrate de hablar cerca del micrófono e intenta de nuevo!")
                 else:
-                    # ── PASO 2: Transcripción (Whisper) ────────────────────────
+                    # ── PASO 2: Transcripción ──
                     with st.spinner("✍️ Transcribiendo audio con Whisper..."):
                         resultados = transcribe_segments(audio_data, timestamps, whisper_model, fs=16000)
                     
                     texto_completo = " ".join([r["text"] for r in resultados]).strip()
                     
                     if texto_completo:
-                        # Registrar palabras clave usadas del vocabulario
+                        # Registrar palabras clave usadas
                         for goal in active_mission.get("vocabulary_goals", []):
                             if goal.lower() in texto_completo.lower():
                                 st.session_state.used_vocabulary.add(goal.lower())
 
-                        # Agregar el mensaje del usuario a la interfaz
+                        # Agregar el mensaje del usuario
                         st.session_state.messages.append({"role": "user", "content": texto_completo})
                         
-                        # ── PASO 3: Ollama Chat Response (Rol & Nivel) ──────────────
+                        # ── PASO 3: Ollama ──
                         with st.spinner("🤖 Pensando respuesta como Neobit (Principiante)..."):
                             respuesta, new_history = get_chat_response(
                                 user_text=texto_completo,
@@ -721,47 +1047,53 @@ with col2:
                                 mission_data=active_mission
                             )
                             
-                        # Actualizar historial plano de Ollama
                         st.session_state.ollama_history = new_history
                         
                         note_text = respuesta["note"]
                         spoken_text = respuesta.get("spoken", "")
 
-                        # Evaluar objetivos si la misión activa es 'order_food'
+                        # Evaluar objetivos para 'order_food'
                         if active_mission and active_mission.get("id") == "order_food":
-                            objectives = evaluate_order_food_objectives(st.session_state.messages + [{"role": "assistant", "spoken": spoken_text, "note": note_text}])
+                            all_msgs = st.session_state.messages + [{"role": "assistant", "spoken": spoken_text, "note": note_text}]
+                            objectives = evaluate_order_food_objectives(all_msgs)
                             st.session_state.mission_objectives = objectives
 
-                            # Detección de finalización: comida elegida, bebida elegida, orden confirmada y cliente confirma
-                            completed = (
-                                objectives.get("food_selected") and
-                                objectives.get("drink_selected") and
-                                objectives.get("order_confirmed") and
-                                check_client_confirmation(spoken_text)
+                            # Detección de finalización:
+                            # 1. Los 3 items elegidos via extract_order_state (fuente de verdad)
+                            # 2. El usuario se despidió en este turno
+                            user_said_farewell = any(
+                                p in texto_completo.lower() for p in FAREWELL_PHRASES
                             )
+                            completed = user_said_farewell
 
                             if completed:
                                 st.session_state.mission_completed = True
-                                analysis = analyze_conversation(st.session_state.messages + [{"role": "assistant", "spoken": spoken_text}], active_mission.get("vocabulary_goals"))
+                                # Análisis completo de TODA la conversación
+                                analysis = analyze_conversation(
+                                    st.session_state.messages + [{"role": "assistant", "spoken": spoken_text}],
+                                    active_mission.get("vocabulary_goals")
+                                )
+
                                 # No hay penalización de objetivos ya que todos están completos
                                 final_score = analysis.get("score", 100)
+
                                 st.session_state.mission_feedback = {
                                     "score": final_score,
                                     "objectives": objectives,
                                     "corrections": analysis.get("corrections", []),
+                                    "better_alternatives": analysis.get("better_alternatives", []),
                                     "strengths": analysis.get("strengths", []),
                                     "vocab_used": analysis.get("vocab_used", []),
                                     "suggestions": analysis.get("suggestions", []),
                                 }
 
-                        # Agregar la respuesta del asistente a la interfaz
+                        # Agregar la respuesta del asistente
                         st.session_state.messages.append({
                             "role": "assistant",
                             "spoken": respuesta["spoken"],
                             "note": note_text
                         })
 
-                        # Redirigir el renderizado y gatillar TTS antes de volver a pintar la pantalla
                         st.rerun()
                     else:
                         st.warning("⚠️ No se pudo transcribir ningún texto. Por favor habla de nuevo.")
@@ -778,15 +1110,15 @@ user_text_input = st.chat_input("Escribe tu respuesta aquí en inglés...", disa
 if user_text_input and not st.session_state.mission_completed:
     texto_completo = user_text_input.strip()
     
-    # Registrar palabras clave usadas del vocabulario
+    # Registrar palabras clave
     for goal in active_mission.get("vocabulary_goals", []):
         if goal.lower() in texto_completo.lower():
             st.session_state.used_vocabulary.add(goal.lower())
 
-    # Agregar el mensaje del usuario a la interfaz
+    # Agregar mensaje del usuario
     st.session_state.messages.append({"role": "user", "content": texto_completo})
     
-    # ── PASO 3: Ollama Chat Response (Rol & Nivel) ──────────────
+    # ── Ollama ──
     with st.spinner("🤖 Pensando respuesta como Neobit (Principiante)..."):
         respuesta, new_history = get_chat_response(
             user_text=texto_completo,
@@ -795,38 +1127,44 @@ if user_text_input and not st.session_state.mission_completed:
             mission_data=active_mission
         )
         
-    # Actualizar historial plano de Ollama
     st.session_state.ollama_history = new_history
     
     note_text = respuesta["note"]
     spoken_text = respuesta.get("spoken", "")
 
+    # Evaluar objetivos para 'order_food'
     if active_mission and active_mission.get("id") == "order_food":
-        objectives = evaluate_order_food_objectives(st.session_state.messages + [{"role": "assistant", "spoken": spoken_text, "note": note_text}])
+        all_msgs = st.session_state.messages + [{"role": "assistant", "spoken": spoken_text, "note": note_text}]
+        objectives = evaluate_order_food_objectives(all_msgs)
         st.session_state.mission_objectives = objectives
 
-        # Detección de finalización: comida elegida, bebida elegida, orden confirmada y cliente confirma
-        completed = (
-            objectives.get("food_selected") and
-            objectives.get("drink_selected") and
-            objectives.get("order_confirmed") and
-            check_client_confirmation(spoken_text)
+        # Detección de finalización:
+        # 1. Los 3 items elegidos via extract_order_state (fuente de verdad)
+        # 2. El usuario se despidió en este turno
+        user_said_farewell = any(
+            p in texto_completo.lower() for p in FAREWELL_PHRASES
         )
+        completed = user_said_farewell
 
         if completed:
             st.session_state.mission_completed = True
-            analysis = analyze_conversation(st.session_state.messages + [{"role": "assistant", "spoken": spoken_text}], active_mission.get("vocabulary_goals"))
+            analysis = analyze_conversation(
+                st.session_state.messages + [{"role": "assistant", "spoken": spoken_text}],
+                active_mission.get("vocabulary_goals")
+            )
             final_score = analysis.get("score", 100)
+
             st.session_state.mission_feedback = {
                 "score": final_score,
                 "objectives": objectives,
                 "corrections": analysis.get("corrections", []),
+                "better_alternatives": analysis.get("better_alternatives", []),
                 "strengths": analysis.get("strengths", []),
                 "vocab_used": analysis.get("vocab_used", []),
                 "suggestions": analysis.get("suggestions", []),
             }
 
-    # Agregar la respuesta del asistente a la interfaz
+    # Agregar respuesta del asistente
     st.session_state.messages.append({
         "role": "assistant",
         "spoken": respuesta["spoken"],
@@ -840,7 +1178,6 @@ if user_text_input and not st.session_state.mission_completed:
 # Reproducir automáticamente la última respuesta del robot si es nueva
 if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
     last_msg = st.session_state.messages[-1]
-    # Usar una bandera para reproducir el audio del último mensaje solo una vez por renderizado
     if "last_played_msg" not in st.session_state or st.session_state.last_played_msg != last_msg["spoken"]:
         st.session_state.last_played_msg = last_msg["spoken"]
         if tts_synthesizer and last_msg["spoken"]:

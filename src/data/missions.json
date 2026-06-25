@@ -1,0 +1,24 @@
+{
+  "restaurante": {
+    "name": "Restaurante",
+    "missions": [
+      {
+        "id": "order_food",
+        "title": "Order food",
+        "starter_line": "Hello! I'd like to order, please.",
+        "neobit_role": "A hungry customer ready to order dinner. You want to order a burger, fries, and a cold drink. You also ask how long the food will take.",
+        "user_role": "A busy but friendly waiter taking the dinner order.",
+        "vocabulary_goals": [
+          "order",
+          "burger",
+          "fries",
+          "drink",
+          "please",
+          "hungry",
+          "how long"
+        ],
+        "narrative_context": "Eres el mesero encargado de tomar la orden de Neobit. Él tiene mucha hambre y quiere pedir una hamburguesa con papas fritas y una bebida fría, además de saber cuánto tardará."
+      }
+    ]
+  }
+}

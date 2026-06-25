@@ -6,3 +6,4 @@ sounddevice
 scipy
 azure-cognitiveservices-speech
 python-dotenv
+streamlit
